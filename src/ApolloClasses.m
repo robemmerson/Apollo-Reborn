@@ -23,6 +23,7 @@ Class ApolloClassASTableViewController;
 Class ApolloClassASTextNode;
 Class ApolloClassASTextNode2;
 Class ApolloClassAccountManager;
+Class ApolloClassAccountManagerViewController;
 Class ApolloClassActionController;
 Class ApolloClassApolloContentBridge;
 Class ApolloClassApolloDefaultTableViewCell;
@@ -155,6 +156,7 @@ __attribute__((constructor)) static void ApolloClassesResolve(void) {
     ApolloClassASTextNode = objc_getClass("ASTextNode");
     ApolloClassASTextNode2 = objc_getClass("ASTextNode2");
     ApolloClassAccountManager = objc_getClass("_TtC6Apollo14AccountManager");
+    ApolloClassAccountManagerViewController = objc_getClass("_TtC6Apollo28AccountManagerViewController");
     ApolloClassActionController = objc_getClass("_TtC6Apollo16ActionController");
     ApolloClassApolloContentBridge = objc_getClass("ApolloContentBridge");
     ApolloClassApolloDefaultTableViewCell = objc_getClass("_TtC6Apollo26ApolloDefaultTableViewCell");

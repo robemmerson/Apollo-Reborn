@@ -1,7 +1,13 @@
+#import "ApolloAccountSwitchLink.h"
+#import "ApolloAccountSwitchLinkStore.h"
+#import "ApolloAccountSwitcherViewController.h"
 #import "ApolloCommon.h"
+#import "ApolloState.h"
+#import "ApolloToast.h"
 #import "settings/ApolloBackupDocument.h"
 #import "ApolloDirectChatWeb.h"
 #import "settings/ApolloSettingsRouter.h"
+#import <QuartzCore/QuartzCore.h>
 #import <UserNotifications/UserNotifications.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -215,20 +221,112 @@ static BOOL ApolloQuickActionsOpenModernMailboxNow(NSDictionary<NSString *, NSSt
 }
 
 // Retries `perform` every 250ms (the tab bar controller may not exist yet on a
-// cold launch from a URL), giving up after 8 retries.
-static void ApolloQuickActionsRetry(NSString *description, BOOL (^perform)(void), NSUInteger attempt) {
+// cold launch from a URL), giving up after `maxRetries` retries and then
+// running `giveUp` (optional).
+static void ApolloQuickActionsRetryUpTo(NSString *description, NSUInteger maxRetries, BOOL (^perform)(void),
+                                        void (^giveUp)(void), NSUInteger attempt) {
     if (perform()) return;
-    if (attempt >= 8) {
+    if (attempt >= maxRetries) {
         ApolloLog(@"[QuickActions] Gave up %@", description);
+        if (giveUp) giveUp();
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApolloQuickActionsRetry(description, perform, attempt + 1);
+        ApolloQuickActionsRetryUpTo(description, maxRetries, perform, giveUp, attempt + 1);
     });
+}
+
+static void ApolloQuickActionsRetry(NSString *description, BOOL (^perform)(void), NSUInteger attempt) {
+    ApolloQuickActionsRetryUpTo(description, 8, perform, nil, attempt);
+}
+
+#pragma mark - Shortcut account-switch links
+
+// apollo://reborn/account/<username>?key=<secret> (ApolloAccountSwitchLink.h).
+// Every account/... link is claimed, valid or not, so Apollo's native router
+// never sees one. Log hygiene: never the key, the link or the username — only
+// the verdict and counts.
+
+static ApolloAccountSwitchLinkLockout sApolloAccountLinkLockout;
+
+static void ApolloAccountLinkShowRejected(void) {
+    // One message for every rejection: it never says whether the account exists.
+    ApolloShowToastWithStyle(@"Account switch link rejected", nil, ApolloToastStyleError, nil);
+}
+
+static void ApolloAccountLinkShowOutcome(ApolloAccountLinkSwitchOutcome outcome, NSString *displayName) {
+    switch (outcome) {
+        case ApolloAccountLinkSwitchOutcomeSwitched:
+            // The success haptic already played in ApolloAccountSwitcherDriveLiveSwitch.
+            ApolloShowToast([NSString stringWithFormat:@"Switched to u/%@", displayName]);
+            break;
+        case ApolloAccountLinkSwitchOutcomeAlreadyActive:
+            ApolloShowToastWithStyle([NSString stringWithFormat:@"Already using u/%@", displayName], nil, ApolloToastStyleInfo, nil);
+            break;
+        case ApolloAccountLinkSwitchOutcomeUnknownAccount:
+            ApolloAccountLinkShowRejected();
+            break;
+        case ApolloAccountLinkSwitchOutcomeBusy:
+            ApolloShowToastWithStyle(@"Couldn't switch accounts", @"Close the open screen and try again.", ApolloToastStyleError, nil);
+            break;
+        case ApolloAccountLinkSwitchOutcomeFailed:
+            ApolloShowToastWithStyle(@"Couldn't switch accounts", nil, ApolloToastStyleError, nil);
+            break;
+    }
+}
+
+static void ApolloAccountLinkPerform(NSString *username, NSString *key) {
+    BOOL enabled = sAccountSwitchLinksEnabled;
+    NSString *storedKey = enabled ? ApolloAccountSwitchLinkStoredKey() : nil;
+    ApolloAccountSwitchLinkVerdict verdict = ApolloAccountSwitchLinkEvaluate(enabled, sApolloAccountLinkLockout.lockedOut,
+                                                                             storedKey, key, username);
+    switch (verdict) {
+        case ApolloAccountSwitchLinkVerdictIgnore:
+            ApolloLog(@"[AccountLink] Ignored: locked out until relaunch");
+            return;
+        case ApolloAccountSwitchLinkVerdictRejectDisabled:
+            ApolloLog(@"[AccountLink] Rejected: feature off");
+            ApolloAccountLinkShowRejected();
+            return;
+        case ApolloAccountSwitchLinkVerdictRejectKey: {
+            BOOL lockedOut = ApolloAccountSwitchLinkLockoutRecordFailure(&sApolloAccountLinkLockout, CACurrentMediaTime());
+            ApolloLog(@"[AccountLink] Rejected: %@ key (%lu in window)%@", key.length ? @"wrong" : @"missing",
+                      (unsigned long)sApolloAccountLinkLockout.count, lockedOut ? @"; locked out until relaunch" : @"");
+            ApolloAccountLinkShowRejected();
+            return;
+        }
+        case ApolloAccountSwitchLinkVerdictRejectUsername:
+            ApolloLog(@"[AccountLink] Rejected: no usable username");
+            ApolloAccountLinkShowRejected();
+            return;
+        case ApolloAccountSwitchLinkVerdictAccept:
+            break;
+    }
+
+    ApolloLog(@"[AccountLink] Accepted; switching");
+    // Up to 6s: on a cold start the account list loads after the tab bar.
+    ApolloQuickActionsRetryUpTo(@"switching account from a link", 24, ^BOOL{
+        return ApolloAccountSwitcherSwitchToUsername(username, ^(ApolloAccountLinkSwitchOutcome outcome, NSString *displayName) {
+            ApolloAccountLinkShowOutcome(outcome, displayName);
+        });
+    }, ^{
+        ApolloAccountLinkShowOutcome(ApolloAccountLinkSwitchOutcomeFailed, nil);
+    }, 0);
+}
+
+static BOOL ApolloQuickActionsHandleAccountLink(NSURL *url) {
+    NSString *username = nil;
+    NSString *key = nil;
+    if (!ApolloAccountSwitchLinkParse(url, &username, &key)) return NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloAccountLinkPerform(username, key);
+    });
+    return YES;
 }
 
 static BOOL ApolloQuickActionsHandleURL(NSURL *url) {
     if (ApolloBackupDocumentHandleURL(url)) return YES;
+    if (ApolloQuickActionsHandleAccountLink(url)) return YES;
     NSDictionary<NSString *, NSString *> *mailboxRoute = ApolloModernMailboxRouteFromURL(url);
     if (mailboxRoute) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -286,10 +384,34 @@ static BOOL ApolloQuickActionsHandleURL(NSURL *url) {
 
 %end
 
+// While YES, UISceneConnectionOptions hides account-switch links, so Apollo's
+// own cold-start handling in -scene:willConnectToSession:options: never routes
+// one natively.
+static BOOL sApolloHideAccountLinksFromConnectionOptions = NO;
+
+%hook UISceneConnectionOptions
+
+- (NSSet<UIOpenURLContext *> *)URLContexts {
+    NSSet<UIOpenURLContext *> *contexts = %orig;
+    if (!sApolloHideAccountLinksFromConnectionOptions || contexts.count == 0) return contexts;
+    return [contexts objectsPassingTest:^BOOL(UIOpenURLContext *context, __unused BOOL *stop) {
+        return !ApolloAccountSwitchLinkIsAccountURL(context.URL);
+    }];
+}
+
+%end
+
 %hook _TtC6Apollo13SceneDelegate
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+    // A cold launch from an account-switch link: take it here (it waits for
+    // the tab bar via the retry loop) and keep it away from native startup.
+    for (UIOpenURLContext *context in connectionOptions.URLContexts) {
+        ApolloQuickActionsHandleAccountLink(context.URL);
+    }
+    sApolloHideAccountLinksFromConnectionOptions = YES;
     %orig(scene, session, connectionOptions);
+    sApolloHideAccountLinksFromConnectionOptions = NO;
     // UIKit delivers cold-start documents here instead of openURLContexts:.
     // Only claim backup files; existing native startup remains untouched.
     for (UIOpenURLContext *context in connectionOptions.URLContexts) {

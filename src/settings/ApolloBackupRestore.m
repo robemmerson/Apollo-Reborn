@@ -1,6 +1,7 @@
 #import "settings/ApolloBackupRestore.h"
 #import "settings/ApolloAutomaticBackup.h"
 
+#import "ApolloAccountSwitchLinkStore.h"
 #import "ApolloCommon.h"
 #import "ApolloPerAccountFavorites.h"
 #import "ApolloState.h"
@@ -734,6 +735,12 @@ BOOL ApolloBackupRestoreRestoreFromZipURL(NSURL *zipURL, NSString **outErrorTitl
         return NO;
     }
     ApolloPerAccountFavoritesSuspendForPreferencesRestore();
+
+    // The Shortcut account-switch key is never in a backup (its keychain
+    // service isn't one ApolloBackupOwnsKeychainIdentity owns). Drop the live
+    // one too, so restored settings that turn the feature on get a fresh key
+    // rather than one that predates the restore.
+    ApolloAccountSwitchLinkForgetKey();
 
     // Restore main preferences, skipping analytics/tracking keys
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];

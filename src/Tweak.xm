@@ -3758,6 +3758,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
                                     UDKeyTabBarSwipeNavigation: @NO,
+                                    UDKeyAccountSwitchLinksEnabled: @NO,
                                     UDKeyLiquidGlassEnabled: @YES,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
@@ -4071,6 +4072,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // sLiquidGlassEnabled was already latched in ApolloCommon +load. Do not
     // reload it here: UIKit and early hook constructors use that launch choice.
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
+    sAccountSwitchLinksEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAccountSwitchLinksEnabled];
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];
     sInfoRowTapComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapComments];

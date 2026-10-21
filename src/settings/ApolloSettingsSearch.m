@@ -182,6 +182,9 @@ static NSArray<ApolloSettingsSearchEntry *> *ApolloSettingsSearchBuildIndex(UITr
         screen.routeId = routeId;
         [entries addObject:screen];
 
+        // Its rows belong to (and are indexed with) the screen it scrolls.
+        if (ApolloSettingsRouteIsSectionAnchor(routeId)) continue;
+
         UIViewController *vc = ApolloSettingsRouteInstantiate(routeId);
         @try {
             [vc loadViewIfNeeded];

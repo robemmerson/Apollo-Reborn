@@ -33,6 +33,7 @@ extern Class ApolloClassASTableViewController;
 extern Class ApolloClassASTextNode;
 extern Class ApolloClassASTextNode2;
 extern Class ApolloClassAccountManager;
+extern Class ApolloClassAccountManagerViewController;
 extern Class ApolloClassActionController;
 extern Class ApolloClassApolloContentBridge;
 extern Class ApolloClassApolloDefaultTableViewCell;

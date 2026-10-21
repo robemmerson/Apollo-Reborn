@@ -28,6 +28,12 @@ NSString *ApolloSettingsRouteBreadcrumb(NSString *routeId);
 // All registered route ids, in presentation order (aliases excluded).
 NSArray<NSString *> *ApolloSettingsRouteIds(void);
 
+// YES for a route that opens a section of another route's screen (e.g.
+// "account-switching" → Accounts & API Keys, scrolled to that section).
+// Settings search lists it as a destination but doesn't scan its rows, which
+// the owning screen's route already indexes.
+BOOL ApolloSettingsRouteIsSectionAnchor(NSString *routeId);
+
 // A fresh instance of the route's view controller, or nil for unknown ids.
 // Used by settings search to scan screens for their rows without presenting
 // them, and by callers that need to push/present a screen themselves.

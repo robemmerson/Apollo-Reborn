@@ -88,6 +88,14 @@ int main(void) {
               ![sLogs.lastObject containsString:@"\n"] && [sLogs.lastObject hasSuffix:@": forged?[BackupRestore] Backup validated"],
               @"a logged service name cannot add log lines");
 
+        // The Shortcut account-switch key (ApolloAccountSwitchLinkStore.m) is
+        // never captured, and a hand-edited archive carrying it never writes it.
+        Check(!ApolloBackupOwnsKeychainIdentity(@"com.christianselig.Apollo.accountswitch", @"linkKey"),
+              @"backup capture skips the account-switch link key");
+        NSArray *withLinkKey = [owned arrayByAddingObject:Row(@"com.christianselig.Apollo.accountswitch", @"linkKey", blob)];
+        Check([ApolloBackupRestorableKeychainItems(withLinkKey) isEqualToArray:owned], @"restore drops an account-switch link key row");
+        Check(ApolloBackupValidatedKeychainItems(withLinkKey) == nil, @"the write boundary refuses an account-switch link key row");
+
         // Corrupt files still reject the whole backup.
         Check(ApolloBackupRestorableKeychainItems(@{}) == nil, @"a non-array keychain.plist rejects");
         Check(ApolloBackupRestorableKeychainItems([legacy arrayByAddingObject:@"junk"]) == nil, @"a non-dictionary entry rejects");

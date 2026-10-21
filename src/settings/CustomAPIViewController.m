@@ -27,6 +27,10 @@
 #import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
 #import "ApolloKagiSearchParsing.h"  // ApolloKagiNormalizeSessionToken()
 #import "ApolloAccountCredentials.h"
+#import "ApolloAccountSwitchLink.h"
+#import "ApolloAccountSwitchLinkStore.h"
+#import "ApolloAccountSwitcherViewController.h" // ApolloAccountSwitcherLiveUsernames()
+#import "ApolloToast.h"
 #import "ApolloWebJSON.h"           // ApolloWebJSONBearerIsSynthetic() — widget setup code
 #import "ApolloPerAccountFavorites.h"
 #import "ApolloFavoritesSorting.h"
@@ -1830,6 +1834,176 @@ typedef NS_ENUM(NSInteger, Tag) {
     return [ApolloSettingsSection sectionWithTitle:@"Experimental"
                                             footer:@"Sign in to reddit.com instead of using API keys."
                                               rows:@[ webJSON, webSessionLogin, reduceRateLimiting, modernChat, modernModmail ]];
+}
+
+// Shortcut account switching: apollo://reborn/account/<username>?key=<key>
+// (ApolloAccountSwitchLink.h). The key is only ever in the keychain; this
+// screen masks it, reveals it for 10 seconds on tap, and copies it (or a
+// ready-made link) with the same local-only, 10-minute clipboard copy as the
+// widget setup code. Registered as route "account-switching".
+static BOOL sAccountSwitchLinkKeyRevealed = NO;
+static NSUInteger sAccountSwitchLinkRevealGeneration = 0;
+
+- (ApolloSettingsSection *)buildAPIKeysAccountSwitchingSection {
+    __weak typeof(self) weakSelf = self;
+    BOOL (^enabled)(void) = ^BOOL { return sAccountSwitchLinksEnabled; };
+
+    ApolloSettingsRow *allow =
+        [ApolloSettingsRow customRowWithID:@"api.accountLinks.enabled"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_AccountLinks"
+                                                label:@"Allow Account Switch Links"
+                                               detail:@"Lets a Shortcut switch the active account by opening a link that carries this key."
+                                                   on:sAccountSwitchLinksEnabled
+                                               action:@selector(accountSwitchLinksSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *key =
+        [ApolloSettingsRow customRowWithID:@"api.accountLinks.key"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_API_AccountLinksKey"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_API_AccountLinksKey"];
+                cell.detailTextLabel.numberOfLines = 0;
+                cell.detailTextLabel.lineBreakMode = NSLineBreakByCharWrapping;
+            }
+            // A restore drops the key (ApolloBackupRestore.m), so a feature
+            // that comes back on from a backup gets its fresh key here.
+            NSString *value = ApolloAccountSwitchLinkEnsureKey();
+            cell.textLabel.text = @"Key";
+            cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:[UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline].pointSize
+                                                                    weight:UIFontWeightRegular];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            if (!value) {
+                cell.detailTextLabel.text = @"Unavailable — unlock your device and try again";
+            } else if (sAccountSwitchLinkKeyRevealed) {
+                cell.detailTextLabel.text = value;
+            } else {
+                cell.detailTextLabel.text = [ApolloAccountSwitchLinkMaskedKey(value) stringByAppendingString:@"   Tap to show"];
+            }
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf apollo_revealAccountSwitchLinkKey]; }];
+    key.visible = enabled;
+
+    ApolloSettingsRow *copyKey =
+        [ApolloSettingsRow buttonRowWithID:@"api.accountLinks.copyKey"
+                                     title:@"Copy Key"
+                                    action:^{
+            NSString *value = ApolloAccountSwitchLinkEnsureKey();
+            if (!value) {
+                [weakSelf showAlertWithTitle:@"Key Unavailable" message:@"Unlock your device and try again."];
+                return;
+            }
+            [weakSelf apollo_copyToPasteboardLocalOnlyExpiring:value];
+            ApolloShowToastWithStyle(@"Key Copied", @"It clears from the clipboard in 10 minutes.", ApolloToastStyleSuccess, nil);
+        }];
+    copyKey.visible = enabled;
+
+    ApolloSettingsRow *copyLink =
+        [ApolloSettingsRow buttonRowWithID:@"api.accountLinks.copyLink"
+                                     title:@"Copy Link for…"
+                                    action:^{ [weakSelf apollo_presentAccountSwitchLinkPicker]; }];
+    copyLink.visible = enabled;
+
+    ApolloSettingsRow *regenerate =
+        [ApolloSettingsRow customRowWithID:@"api.accountLinks.regenerate"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_API_AccountLinksRegenerate"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_API_AccountLinksRegenerate"];
+            }
+            cell.textLabel.text = @"Regenerate Key";
+            cell.textLabel.textColor = [UIColor systemRedColor];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf apollo_confirmRegenerateAccountSwitchLinkKey]; }];
+    regenerate.visible = enabled;
+
+    return [ApolloSettingsSection sectionWithTitle:@"Shortcut Account Switching"
+                                            footer:@"In the Shortcuts app, add Choose from Menu with one item per account. Under each item, add Open URLs with that account's link from Copy Link for…. Anyone with the key can switch your active account, so keep it private, and regenerate it if it leaks."
+                                              rows:@[ allow, key, copyKey, copyLink, regenerate ]];
+}
+
+- (void)accountSwitchLinksSwitchToggled:(UISwitch *)sender {
+    if (sender.isOn && !ApolloAccountSwitchLinkEnsureKey()) {
+        [sender setOn:NO animated:YES];
+        [self showAlertWithTitle:@"Couldn't Create a Key" message:@"Unlock your device and try again."];
+        return;
+    }
+    sAccountSwitchLinksEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyAccountSwitchLinksEnabled];
+    ApolloLog(@"[AccountLink] Links %@", sender.isOn ? @"enabled" : @"disabled");
+    [self visibilityDidChange];
+}
+
+- (void)apollo_revealAccountSwitchLinkKey {
+    sAccountSwitchLinkKeyRevealed = YES;
+    NSUInteger generation = ++sAccountSwitchLinkRevealGeneration;
+    [self reloadRowWithID:@"api.accountLinks.key"];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // A later tap restarts the 10 seconds.
+        if (generation != sAccountSwitchLinkRevealGeneration) return;
+        sAccountSwitchLinkKeyRevealed = NO;
+        [weakSelf reloadRowWithID:@"api.accountLinks.key"];
+    });
+}
+
+- (void)apollo_presentAccountSwitchLinkPicker {
+    NSString *value = ApolloAccountSwitchLinkEnsureKey();
+    if (!value) {
+        [self showAlertWithTitle:@"Key Unavailable" message:@"Unlock your device and try again."];
+        return;
+    }
+    NSArray<NSString *> *usernames = ApolloAccountSwitcherLiveUsernames();
+    if (usernames.count == 0) {
+        [self showAlertWithTitle:@"No Accounts" message:@"Sign in to an account first, then copy its link."];
+        return;
+    }
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Copy Link for…"
+                                                                   message:@"Paste the link into an Open URLs action in your Shortcut."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *username in usernames) {
+        [sheet addAction:[UIAlertAction actionWithTitle:[@"u/" stringByAppendingString:username]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            // Re-read in case the key was regenerated while the sheet was up.
+            NSString *current = ApolloAccountSwitchLinkStoredKey();
+            if (!current) return;
+            [weakSelf apollo_copyToPasteboardLocalOnlyExpiring:ApolloAccountSwitchLinkURLString(username, current)];
+            ApolloShowToastWithStyle([NSString stringWithFormat:@"Link for u/%@ Copied", username],
+                                     @"It clears from the clipboard in 10 minutes.", ApolloToastStyleSuccess, nil);
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *cell = [self cellForRowID:@"api.accountLinks.copyLink"];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)apollo_confirmRegenerateAccountSwitchLinkKey {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Regenerate Key?"
+                                                                   message:@"Existing Shortcuts will stop working until you update them."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Regenerate" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        if (!ApolloAccountSwitchLinkRegenerateKey()) {
+            [weakSelf showAlertWithTitle:@"Couldn't Regenerate" message:@"The old key still works. Unlock your device and try again."];
+            return;
+        }
+        sAccountSwitchLinkKeyRevealed = NO;
+        sAccountSwitchLinkRevealGeneration++;
+        [weakSelf reloadRowWithID:@"api.accountLinks.key"];
+        ApolloShowToast(@"New Key Created");
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (ApolloSettingsSection *)buildAPIKeysExtrasSection {
@@ -4033,12 +4207,7 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
         return;
     }
     NSString *code = [json base64EncodedStringWithOptions:0];
-    NSDictionary *item = @{ @"public.utf8-plain-text": code };
-    NSDictionary *options = @{
-        UIPasteboardOptionLocalOnly: @YES,
-        UIPasteboardOptionExpirationDate: [NSDate dateWithTimeIntervalSinceNow:10 * 60],
-    };
-    [[UIPasteboard generalPasteboard] setItems:@[item] options:options];
+    [self apollo_copyToPasteboardLocalOnlyExpiring:code];
     ApolloLog(@"[WidgetSetup] Copied a v%@ setup code %@", payload[@"v"], account ? @"with account" : @"without account");
 
     NSString *how = @"Long-press an Apollo widget → Edit Widget and paste it into Setup Code. One paste covers every widget";
@@ -4046,6 +4215,17 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
                      message:account
                          ? [NSString stringWithFormat:@"Setup code copied. %@. It includes your account login, so don't share it.", how]
                          : [NSString stringWithFormat:@"Setup code copied. %@ and removes any account you added before.", how]];
+}
+
+// Copies a secret-bearing string to this device only (no Universal Clipboard)
+// and lets it expire after 10 minutes.
+- (void)apollo_copyToPasteboardLocalOnlyExpiring:(NSString *)string {
+    NSDictionary *item = @{ @"public.utf8-plain-text": string ?: @"" };
+    NSDictionary *options = @{
+        UIPasteboardOptionLocalOnly: @YES,
+        UIPasteboardOptionExpirationDate: [NSDate dateWithTimeIntervalSinceNow:10 * 60],
+    };
+    [[UIPasteboard generalPasteboard] setItems:@[item] options:options];
 }
 
 - (void)testNotificationBackendConnection {
@@ -5080,6 +5260,16 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 
 @implementation ApolloAccountsAPIKeysViewController
 - (NSString *)apollo_screenTitle { return @"Accounts & API Keys"; }
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    NSString *rowID = self.focusRowIDOnAppear;
+    if (!rowID) return;
+    self.focusRowIDOnAppear = nil;
+    NSIndexPath *indexPath = [self indexPathForRowID:rowID];
+    if (indexPath) {
+        [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:UITableViewScrollPositionTop animated:YES];
+    }
+}
 - (void)viewDidLoad {
     [super viewDidLoad];
     // The sign-in and rate-limit offers can turn Reduce Rate Limiting on while
@@ -5106,6 +5296,7 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
               [self buildAPIKeysKagiSection],
               [self buildAPIKeysSignInSection],
               [self buildAPIKeysExperimentalSection],
+              [self buildAPIKeysAccountSwitchingSection],
               [self buildAPIKeysExtrasSection] ];
 }
 @end

@@ -219,6 +219,9 @@ extern ApolloSettingsIconAppearance sSettingsIconAppearance;
 // Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
 // switching tabs; needs a relaunch to apply. See ApolloLiquidGlass.xm.
 extern BOOL sTabBarSwipeNavigation;
+// Shortcut account-switch links (apollo://reborn/account/...). See
+// ApolloAccountSwitchLink.h.
+extern BOOL sAccountSwitchLinksEnabled;
 #ifdef __cplusplus
 extern "C" {
 #endif

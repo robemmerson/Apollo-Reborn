@@ -655,6 +655,44 @@ static BOOL ApolloAccountReorderSchedulePersist(
     return scheduled;
 }
 
+#pragma mark - Driving a live switch
+
+// Mirrors the native switch-mode branch of -tableView:didSelectRowAtIndexPath:
+// (verified in Hopper: with accountSwitchType set — which Apollo's own real
+// construction already does for this entry point — that branch reads only
+// the IndexPath argument to derive the row, plus the live AccountManager
+// singleton; it doesn't depend on which UITableView instance is passed).
+// Shared by the overlay's row taps and Shortcut account-switch links. Plays
+// the success haptic and returns YES only when the active account changed.
+static BOOL ApolloAccountSwitcherDriveLiveSwitch(UIViewController *liveManager, NSInteger row) {
+    if (!liveManager) return NO;
+    SEL sel = @selector(tableView:didSelectRowAtIndexPath:);
+    if (![liveManager respondsToSelector:sel]) return NO;
+    NSMethodSignature *sig = [liveManager methodSignatureForSelector:sel];
+    if (!sig) return NO;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.selector = sel;
+    id tv = ApolloObjectIvar(liveManager, "tableView");
+    NSIndexPath *path = [NSIndexPath indexPathForRow:row inSection:0];
+    [inv setArgument:&tv atIndex:2];
+    [inv setArgument:&path atIndex:3];
+    id previousAccount = ApolloActiveAccountClient();
+    UINotificationFeedbackGenerator *feedback = [UINotificationFeedbackGenerator new];
+    [feedback prepare];
+    @try {
+        [inv invokeWithTarget:liveManager];
+    } @catch (NSException *ex) {
+        ApolloLogError(@"[AccountSwitcher] Live switch call failed: %@", ex);
+        return NO;
+    }
+    id selectedAccount = ApolloActiveAccountClient();
+    if (selectedAccount && selectedAccount != previousAccount) {
+        [feedback notificationOccurred:UINotificationFeedbackTypeSuccess];
+        return YES;
+    }
+    return NO;
+}
+
 @implementation ApolloAccountSwitcherViewController
 
 - (void)applyApolloThemeColors {
@@ -1268,36 +1306,9 @@ static BOOL ApolloAccountReorderSchedulePersist(
 
 #pragma mark - Driving the live native instance
 
-// Mirrors the native switch-mode branch of -tableView:didSelectRowAtIndexPath:
-// (verified in Hopper: with accountSwitchType set — which Apollo's own real
-// construction already does for this entry point — that branch reads only
-// the IndexPath argument to derive the row, plus the live AccountManager
-// singleton; it doesn't depend on which UITableView instance is passed).
+// See ApolloAccountSwitcherDriveLiveSwitch.
 - (void)driveLiveSwitchToRow:(NSInteger)row {
-    if (!self.liveManager) return;
-    SEL sel = @selector(tableView:didSelectRowAtIndexPath:);
-    if (![self.liveManager respondsToSelector:sel]) return;
-    NSMethodSignature *sig = [self.liveManager methodSignatureForSelector:sel];
-    if (!sig) return;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.selector = sel;
-    id tv = ApolloObjectIvar(self.liveManager, "tableView");
-    NSIndexPath *path = [NSIndexPath indexPathForRow:row inSection:0];
-    [inv setArgument:&tv atIndex:2];
-    [inv setArgument:&path atIndex:3];
-    id previousAccount = ApolloActiveAccountClient();
-    UINotificationFeedbackGenerator *feedback = [UINotificationFeedbackGenerator new];
-    [feedback prepare];
-    @try {
-        [inv invokeWithTarget:self.liveManager];
-    } @catch (NSException *ex) {
-        ApolloLogError(@"[AccountSwitcher] Live switch call failed: %@", ex);
-        return;
-    }
-    id selectedAccount = ApolloActiveAccountClient();
-    if (selectedAccount && selectedAccount != previousAccount) {
-        [feedback notificationOccurred:UINotificationFeedbackTypeSuccess];
-    }
+    ApolloAccountSwitcherDriveLiveSwitch(self.liveManager, row);
 }
 
 - (void)driveLiveCommitEditingStyle:(UITableViewCellEditingStyle)style atRow:(NSInteger)row {
@@ -1612,11 +1623,15 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
 
 @interface ApolloAccountSwitcherSlideAnimator : NSObject <UIViewControllerAnimatedTransitioning>
 @property (nonatomic) BOOL presenting;
+// Zero-length transition for a Shortcut link switch, which opens and closes
+// the manager only to drive Apollo's own switch.
+@property (nonatomic) BOOL instant;
 @end
 
 @implementation ApolloAccountSwitcherSlideAnimator
 
 - (NSTimeInterval)transitionDuration:(id<UIViewControllerContextTransitioning>)transitionContext {
+    if (self.instant) return 0.0;
     // Matches Apollo's native bottom popup used by the Theme Gallery.
     return 0.30;
 }
@@ -1628,6 +1643,17 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
         [transitionContext viewControllerForKey:UITransitionContextToViewControllerKey];
     UIView *container = transitionContext.containerView;
     NSTimeInterval duration = [self transitionDuration:transitionContext];
+
+    if (self.instant) {
+        if (self.presenting) {
+            toController.view.frame = [transitionContext finalFrameForViewController:toController];
+            [container addSubview:toController.view];
+        } else {
+            [fromController.view removeFromSuperview];
+        }
+        [transitionContext completeTransition:!transitionContext.transitionWasCancelled];
+        return;
+    }
 
     if (self.presenting) {
         UIView *presentedView = toController.view;
@@ -1821,26 +1847,298 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
 
 %end
 
+#pragma mark - Shortcut account-switch links
+
+// apollo://reborn/account/<username>?key=… (validated in ApolloQuickActions.xm)
+// ends up here. There is no safe way to construct an AccountManagerViewController
+// (see the overlay notes above), so a link switch asks Apollo to present one
+// exactly as its Accounts button does, picks the row in -viewDidAppear:, and
+// dismisses it again. Usernames are never logged.
+
+// While YES, the manager's animators run zero-length transitions.
+static BOOL sApolloAccountLinkInstantTransitions = NO;
+
+@interface ApolloAccountLinkSwitchRequest : NSObject
+@property (nonatomic, copy) NSString *username;
+@property (nonatomic, copy) ApolloAccountLinkSwitchCompletion completion;
+@property (nonatomic) BOOL finished;
+@end
+@implementation ApolloAccountLinkSwitchRequest @end
+
+static ApolloAccountLinkSwitchRequest *sApolloPendingAccountLinkSwitch = nil;
+
+// AccountManager.shared, only when it is exactly the class whose layout the
+// reorder guard verifies.
+static id ApolloAccountLinkSharedManager(void) {
+    Class managerClass = ApolloClassAccountManager;
+    SEL sharedSelector = @selector(shared);
+    if (!managerClass || ![managerClass respondsToSelector:sharedSelector]) return nil;
+    id manager = nil;
+    @try {
+        manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, sharedSelector);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+    return manager && object_getClass(manager) == managerClass ? manager : nil;
+}
+
+// The live `accounts` array, read with the same layout checks as the reorder
+// guard (ApolloAccountReorderReadOrder): never retained, never written. Each
+// entry is the account's username as Apollo spells it ("" when an entry has no
+// readable user, so indices still match the manager's rows). *outCurrentIndex
+// is the active row, or -1 when signed out. nil when anything doesn't check out.
+static NSArray<NSString *> *ApolloAccountLinkReadLiveAccounts(NSInteger *outCurrentIndex) {
+    if (outCurrentIndex) *outCurrentIndex = -1;
+    if (![NSThread isMainThread]) return nil;
+    id manager = ApolloAccountLinkSharedManager();
+    if (!manager) return nil;
+
+    Class managerClass = ApolloClassAccountManager;
+    Ivar accountsIvar = class_getInstanceVariable(managerClass, "accounts");
+    Ivar currentIndexIvar = class_getInstanceVariable(managerClass, "currentAccountIndex");
+    if (!ApolloAccountReorderIvarFits(managerClass, accountsIvar, sizeof(uintptr_t)) ||
+        !ApolloAccountReorderIvarFits(managerClass, currentIndexIvar, sizeof(NSInteger) + 1)) return nil;
+
+    SEL countSelector = @selector(totalAccountsObjC);
+    NSMethodSignature *countSignature = [manager methodSignatureForSelector:countSelector];
+    if (!countSignature || countSignature.numberOfArguments != 2 ||
+        countSignature.methodReturnLength != sizeof(NSInteger)) return nil;
+    NSInteger count = 0;
+    @try {
+        count = ((NSInteger (*)(id, SEL))objc_msgSend)(manager, countSelector);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+    if (count < 0 || count > 64) return nil;
+    if (count == 0) return @[];
+
+    ApolloAccountReorderContext context = {0};
+    context.manager = manager;
+    context.accountsIvar = accountsIvar;
+    context.accountCount = (NSUInteger)count;
+    uintptr_t order[64] = {0};
+    if (!ApolloAccountReorderReadOrder(&context, order)) return nil;
+
+    NSMutableArray<NSString *> *usernames = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (NSInteger index = 0; index < count; index++) {
+        id client = (__bridge id)(void *)order[index];
+        NSString *username = nil;
+        @try {
+            id user = [client valueForKey:@"currentUser"];
+            id name = user ? [user valueForKey:@"username"] : nil;
+            if ([name isKindOfClass:[NSString class]]) username = name;
+        } @catch (__unused NSException *exception) { /* not an RDKClient — no name */ }
+        [usernames addObject:username ?: @""];
+    }
+
+    uint8_t *bytes = (uint8_t *)(__bridge void *)manager;
+    ptrdiff_t indexOffset = ivar_getOffset(currentIndexIvar);
+    NSInteger currentIndex = 0;
+    uint8_t discriminator = 0xFF;
+    memcpy(&currentIndex, bytes + indexOffset, sizeof(currentIndex));
+    memcpy(&discriminator, bytes + indexOffset + sizeof(currentIndex), sizeof(discriminator));
+    if (outCurrentIndex && discriminator == 0 && currentIndex >= 0 && currentIndex < count) {
+        *outCurrentIndex = currentIndex;
+    }
+    return usernames;
+}
+
+NSArray<NSString *> *ApolloAccountSwitcherLiveUsernames(void) {
+    NSArray<NSString *> *usernames = ApolloAccountLinkReadLiveAccounts(NULL);
+    if (!usernames) return nil;
+    NSMutableArray<NSString *> *named = [NSMutableArray arrayWithCapacity:usernames.count];
+    for (NSString *username in usernames) {
+        if (username.length > 0) [named addObject:username];
+    }
+    return named;
+}
+
+static NSInteger ApolloAccountLinkIndexOfUsername(NSArray<NSString *> *usernames, NSString *username) {
+    for (NSUInteger index = 0; index < usernames.count; index++) {
+        if (usernames[index].length > 0 &&
+            [usernames[index] caseInsensitiveCompare:username] == NSOrderedSame) return (NSInteger)index;
+    }
+    return -1;
+}
+
+// Any AccountManagerViewController already presented in any window.
+static UIViewController *ApolloAccountLinkPresentedManager(void) {
+    Class managerControllerClass = ApolloClassAccountManagerViewController;
+    if (!managerControllerClass) return nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        for (UIViewController *controller = window.rootViewController.presentedViewController;
+             controller; controller = controller.presentedViewController) {
+            if ([controller isKindOfClass:managerControllerClass]) return controller;
+        }
+    }
+    return nil;
+}
+
+// The Profile tab's ProfileViewController (anywhere in its navigation stack),
+// the owner of Apollo's accountsBarButtonItemTappedWithSender: action.
+static UIViewController *ApolloAccountLinkProfileController(UITabBarController *tabBarController) {
+    Class profileClass = ApolloClassProfileViewController;
+    if (!profileClass) return nil;
+    for (UIViewController *controller in tabBarController.viewControllers) {
+        NSArray<UIViewController *> *stack = [controller isKindOfClass:[UINavigationController class]]
+            ? ((UINavigationController *)controller).viewControllers : @[ controller ];
+        for (UIViewController *candidate in stack) {
+            if ([candidate isMemberOfClass:profileClass]) return candidate;
+        }
+    }
+    return nil;
+}
+
+static void ApolloAccountLinkFinish(ApolloAccountLinkSwitchRequest *request,
+                                    ApolloAccountLinkSwitchOutcome outcome,
+                                    NSString *displayName) {
+    if (!request || request.finished) return;
+    request.finished = YES;
+    if (sApolloPendingAccountLinkSwitch == request) sApolloPendingAccountLinkSwitch = nil;
+    ApolloLog(@"[AccountLink] Switch finished (outcome %ld)", (long)outcome);
+    ApolloAccountLinkSwitchCompletion completion = request.completion;
+    if (completion) completion(outcome, displayName);
+}
+
+// Closes the manager a link switch opened, without animation, then finishes.
+static void ApolloAccountLinkDismissAndFinish(UIViewController *manager,
+                                              ApolloAccountLinkSwitchRequest *request,
+                                              ApolloAccountLinkSwitchOutcome outcome,
+                                              NSString *displayName) {
+    if (!manager.presentingViewController || manager.isBeingDismissed) {
+        ApolloAccountLinkFinish(request, outcome, displayName);
+        return;
+    }
+    sApolloAccountLinkInstantTransitions = YES;
+    [manager dismissViewControllerAnimated:NO completion:^{
+        ApolloAccountLinkFinish(request, outcome, displayName);
+    }];
+    sApolloAccountLinkInstantTransitions = NO;
+}
+
+// Called from the manager's -viewDidAppear:. Does nothing unless a link switch
+// is waiting for this presentation.
+static void ApolloAccountLinkSwitchContinueOnManager(UIViewController *manager) {
+    ApolloAccountLinkSwitchRequest *request = sApolloPendingAccountLinkSwitch;
+    if (!request || request.finished) return;
+
+    // The row is decided now, from the live array, not from what Begin saw.
+    NSInteger currentIndex = -1;
+    NSArray<NSString *> *usernames = ApolloAccountLinkReadLiveAccounts(&currentIndex);
+    NSInteger row = usernames ? ApolloAccountLinkIndexOfUsername(usernames, request.username) : -1;
+    if (!usernames) {
+        ApolloLog(@"[AccountLink] Live account list unreadable on the manager");
+        ApolloAccountLinkDismissAndFinish(manager, request, ApolloAccountLinkSwitchOutcomeFailed, nil);
+        return;
+    }
+    if (row < 0) {
+        ApolloAccountLinkDismissAndFinish(manager, request, ApolloAccountLinkSwitchOutcomeUnknownAccount, nil);
+        return;
+    }
+    NSString *displayName = usernames[(NSUInteger)row];
+    if (row == currentIndex) {
+        ApolloAccountLinkDismissAndFinish(manager, request, ApolloAccountLinkSwitchOutcomeAlreadyActive, displayName);
+        return;
+    }
+
+    BOOL switched = ApolloAccountSwitcherDriveLiveSwitch(manager, row);
+    ApolloLog(@"[AccountLink] Drove the live manager's row selection (switched=%d)", switched);
+    ApolloAccountLinkDismissAndFinish(manager, request,
+                                      switched ? ApolloAccountLinkSwitchOutcomeSwitched : ApolloAccountLinkSwitchOutcomeFailed,
+                                      displayName);
+}
+
+BOOL ApolloAccountSwitcherSwitchToUsername(NSString *username, ApolloAccountLinkSwitchCompletion completion) {
+    ApolloAccountLinkSwitchRequest *request = [ApolloAccountLinkSwitchRequest new];
+    request.username = username;
+    request.completion = completion;
+
+    // Safe-to-touch checks first: anything already driving the manager wins.
+    if (sApolloPendingAccountLinkSwitch || sApolloAccountReorderQuarantined ||
+        sApolloAccountReorderMutationInProgress || ApolloAccountLinkPresentedManager()) {
+        ApolloLog(@"[AccountLink] Busy: account manager in use");
+        ApolloAccountLinkFinish(request, ApolloAccountLinkSwitchOutcomeBusy, nil);
+        return YES;
+    }
+
+    // Cold start: wait for the tabs, the Profile tab and the account list.
+    UIViewController *tabBar = ApolloMainTabBarController();
+    if (![tabBar isKindOfClass:[UITabBarController class]] || !tabBar.view.window) return NO;
+    UIViewController *profile = ApolloAccountLinkProfileController((UITabBarController *)tabBar);
+    if (![profile respondsToSelector:@selector(accountsBarButtonItemTappedWithSender:)]) return NO;
+    NSInteger currentIndex = -1;
+    NSArray<NSString *> *usernames = ApolloAccountLinkReadLiveAccounts(&currentIndex);
+    if (!usernames) return NO;
+
+    NSInteger row = ApolloAccountLinkIndexOfUsername(usernames, username);
+    if (row < 0) {
+        ApolloAccountLinkFinish(request, ApolloAccountLinkSwitchOutcomeUnknownAccount, nil);
+        return YES;
+    }
+    if (row == currentIndex) {
+        ApolloAccountLinkFinish(request, ApolloAccountLinkSwitchOutcomeAlreadyActive, usernames[(NSUInteger)row]);
+        return YES;
+    }
+    // UIKit refuses a second presentation over the tabs (a compose sheet,
+    // the update prompt, …); leave whatever the user has open alone.
+    if (tabBar.presentedViewController) {
+        ApolloLog(@"[AccountLink] Busy: another screen is presented over the tabs");
+        ApolloAccountLinkFinish(request, ApolloAccountLinkSwitchOutcomeBusy, nil);
+        return YES;
+    }
+
+    sApolloPendingAccountLinkSwitch = request;
+    sApolloAccountLinkInstantTransitions = YES;
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(profile, @selector(accountsBarButtonItemTappedWithSender:), nil);
+    } @catch (NSException *exception) {
+        ApolloLogError(@"[AccountLink] Opening the account manager threw: %@", exception.name);
+    } @finally {
+        sApolloAccountLinkInstantTransitions = NO;
+    }
+    ApolloLog(@"[AccountLink] Asked Apollo to open its account manager");
+
+    // -viewDidAppear: normally finishes the request well before this.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (request.finished) return;
+        ApolloLog(@"[AccountLink] Account manager never appeared");
+        UIViewController *manager = ApolloAccountLinkPresentedManager();
+        if (manager) {
+            ApolloAccountLinkDismissAndFinish(manager, request, ApolloAccountLinkSwitchOutcomeFailed, nil);
+        } else {
+            ApolloAccountLinkFinish(request, ApolloAccountLinkSwitchOutcomeFailed, nil);
+        }
+    });
+    return YES;
+}
+
 %hook _TtC6Apollo28AccountManagerViewController
 
 - (id)animationControllerForPresentedController:(UIViewController *)presented
                            presentingController:(UIViewController *)presenting
                                sourceController:(UIViewController *)source {
-    if ([ApolloAccountSwitcherViewController isAvailable]) {
+    if (sApolloAccountLinkInstantTransitions || [ApolloAccountSwitcherViewController isAvailable]) {
         ApolloAccountSwitcherSlideAnimator *animator = [ApolloAccountSwitcherSlideAnimator new];
         animator.presenting = YES;
+        animator.instant = sApolloAccountLinkInstantTransitions;
         return animator;
     }
     return %orig(presented, presenting, source);
 }
 
 - (id)animationControllerForDismissedController:(UIViewController *)dismissed {
-    if ([ApolloAccountSwitcherViewController isAvailable]) {
+    if (sApolloAccountLinkInstantTransitions || [ApolloAccountSwitcherViewController isAvailable]) {
         ApolloAccountSwitcherSlideAnimator *animator = [ApolloAccountSwitcherSlideAnimator new];
         animator.presenting = NO;
+        animator.instant = sApolloAccountLinkInstantTransitions;
         return animator;
     }
     return %orig(dismissed);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloAccountLinkSwitchContinueOnManager((UIViewController *)self);
 }
 
 - (void)viewDidLoad {
