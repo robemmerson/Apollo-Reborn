@@ -15,6 +15,9 @@
 @end
 
 @interface ApolloAccountsAPIKeysViewController : CustomAPIViewController  // Setup → Accounts & API Keys
+// Row to scroll to the first time the screen appears (section deep links such
+// as the "account-switching" route). nil = open at the top.
+@property (nonatomic, copy, nullable) NSString *focusRowIDOnAppear;
 @end
 
 @interface ApolloPostsFeedsViewController : CustomAPIViewController       // Features → Posts & Feeds

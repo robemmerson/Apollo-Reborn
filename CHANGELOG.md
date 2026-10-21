@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Add **Shortcut Account Switching** (Accounts & API Keys, off by default) so a Shortcut can switch your active account by opening `apollo://reborn/account/<username>?key=<key>`: turn on **Allow Account Switch Links**, then use **Copy Link for…** to copy each account's link into a **Choose from Menu** → **Open URLs** Shortcut
+  - Works whether Apollo is open or not, says **Already using u/name** when that account is already active, and switches with the same haptic as the account switcher
+  - The key is generated on your device, kept only in the keychain, and never included in backups; a wrong or missing key just shows **Account switch link rejected**, and five bad links in 10 minutes turn links off until you reopen Apollo
+  - **Regenerate Key** replaces the key if it leaks (update your Shortcuts afterwards); restoring a backup also creates a new one
+  - Open the section directly with `apollo://reborn/settings/account-switching`
+
 ## [v3.9.0] - 2026-10-09
 
 ### Features

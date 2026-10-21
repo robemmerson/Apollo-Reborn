@@ -41,6 +41,7 @@ static NSDictionary<NSString *, NSString *> *sRouteTitles = nil;              //
 static NSDictionary<NSString *, NSString *> *sRouteBreadcrumbs = nil;         // id -> UI location
 static NSDictionary<NSString *, ApolloSettingsRouteBuilder> *sRouteBuilders = nil; // id (incl. aliases) -> builder
 static NSDictionary<NSString *, NSString *> *sRouteAliases = nil;             // alias -> canonical id
+static NSSet<NSString *> *sSectionAnchorRouteIds = nil;                       // ids that open a section of another screen
 
 static void ApolloSettingsRouterEnsureRegistry(void) {
     static dispatch_once_t onceToken;
@@ -68,6 +69,15 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
         }
         // The hub's group screens (settings IA restructure).
         add(@"accounts-api-keys", @"Accounts & API Keys", @"Apollo Reborn → Setup", ApolloSettingsInsetGrouped([ApolloAccountsAPIKeysViewController class]));
+        // Section anchor: Accounts & API Keys, scrolled to its Shortcut
+        // Account Switching section (apollo://reborn/settings/account-switching).
+        add(@"account-switching", @"Shortcut Account Switching", @"Apollo Reborn → Setup → Accounts & API Keys", ^UIViewController *{
+            ApolloAccountsAPIKeysViewController *controller =
+                [[ApolloAccountsAPIKeysViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            controller.focusRowIDOnAppear = @"api.accountLinks.enabled";
+            return controller;
+        });
+        sSectionAnchorRouteIds = [NSSet setWithObject:@"account-switching"];
         add(@"posts-feeds", @"Posts & Feeds", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloPostsFeedsViewController class]));
         add(@"info-row", @"Info Row", @"Apollo Reborn → Features → Posts & Feeds", ApolloSettingsInsetGrouped([InfoRowSettingsViewController class]));
         add(@"comments", @"Comments", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloCommentsSettingsViewController class]));
@@ -148,6 +158,12 @@ NSString *ApolloSettingsRouteBreadcrumb(NSString *routeId) {
 NSArray<NSString *> *ApolloSettingsRouteIds(void) {
     ApolloSettingsRouterEnsureRegistry();
     return sRouteIds;
+}
+
+BOOL ApolloSettingsRouteIsSectionAnchor(NSString *routeId) {
+    if (![routeId isKindOfClass:[NSString class]]) return NO;
+    ApolloSettingsRouterEnsureRegistry();
+    return [sSectionAnchorRouteIds containsObject:routeId.lowercaseString];
 }
 
 UIViewController *ApolloSettingsRouteInstantiate(NSString *routeId) {
